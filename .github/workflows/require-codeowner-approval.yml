@@ -33,7 +33,7 @@ jobs:
           # The GITHUB_TOKEN is automatically passed to github-script
           script: |
             const fs = require('fs');
-            const minimatch = require('minimatch');
+            const { minimatch } = require('minimatch');
             const { owner, repo } = context.repo;
             const prNumber = context.issue.number;
 
