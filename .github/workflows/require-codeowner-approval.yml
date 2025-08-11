@@ -34,9 +34,9 @@ jobs:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: |
           set -e # Exit immediately if a command fails
+          set -x # Print each command before executing it for better debugging
 
           # --- 1. Get Changed Files ---
-          # This determines which files have been modified in the pull request.
           TARGET_BRANCH="${{ github.event.pull_request.base.ref }}"
           echo "Target branch: $TARGET_BRANCH"
           git fetch origin $TARGET_BRANCH
@@ -51,8 +51,6 @@ jobs:
           echo "---------------------"
 
           # --- 2. Get All Code Owners (Users and Teams) for Changed Files ---
-          # This script reads the CODEOWNERS file and collects a unique list of all
-          # owners responsible for the files changed in this PR.
           CODEOWNERS_FILE=".github/CODEOWNERS"
           if [ ! -f "$CODEOWNERS_FILE" ]; then
             echo "No CODEOWNERS file found. Skipping check."
@@ -67,10 +65,7 @@ jobs:
                 gsub(/\./, "\\.", pattern)
                 gsub(/\*/, ".*", pattern)
                 if (f ~ "^" pattern) {
-                  # Print all owners from the rule (from column 2 to the end)
-                  for (i = 2; i <= NF; i++) {
-                    print $i
-                  }
+                  for (i = 2; i <= NF; i++) { print $i }
                   exit
                 }
               }
@@ -80,7 +75,6 @@ jobs:
             fi
           done <<< "$CHANGED_FILES"
 
-          # Get unique, sorted list of raw owners (@user or @org/team)
           UNIQUE_OWNERS_RAW=$(echo "$ALL_OWNERS_RAW" | sed 's/@//g' | sort -u)
           if [ -z "$UNIQUE_OWNERS_RAW" ]; then
               echo "No code owners found for the changed files. Passing."
@@ -88,9 +82,8 @@ jobs:
           fi
 
           # --- 3. Expand Teams into Individual Members ---
-          # Separate users from teams and expand teams by fetching their members via the API.
-          USER_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep -v '/' | tr '\n' ' ')
-          TEAM_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep '/')
+          USER_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep -v '/' | tr '\n' ' ' || true)
+          TEAM_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep '/' || true)
           ALL_TEAM_MEMBERS=""
 
           echo "Required user owner(s): @${USER_OWNERS}"
@@ -102,12 +95,17 @@ jobs:
               TEAM_SLUG=$(echo $team | cut -d'/' -f2)
               TEAM_MEMBERS_URL="https://api.github.com/orgs/$ORG/teams/$TEAM_SLUG/members"
               echo "Fetching members for team @$team from $TEAM_MEMBERS_URL"
+          
+              HTTP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GITHUB_TOKEN" "$TEAM_MEMBERS_URL")
+              if [ "$HTTP_RESPONSE" -ne 200 ]; then
+                echo "ERROR: Failed to fetch team members for @$team. HTTP status: $HTTP_RESPONSE. Check permissions."
+                exit 1
+              fi
               MEMBERS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$TEAM_MEMBERS_URL" | jq -r '.[].login')
               ALL_TEAM_MEMBERS+=$'\n'"$MEMBERS"
             done
           fi
 
-          # Combine individual user owners and all team members into one final list.
           FINAL_OWNERS_LIST=$( (echo "$USER_OWNERS" | tr ' ' '\n'; echo "$ALL_TEAM_MEMBERS") | sort -u | tr '\n' ' ' | sed 's/ $//')
           
           if [ -z "$FINAL_OWNERS_LIST" ]; then
@@ -116,15 +114,13 @@ jobs:
           fi
           echo "All possible owner(s) for this PR: @${FINAL_OWNERS_LIST// / @}"
 
-
           # --- 4. Get All Approvers for the PR via GitHub API ---
-          # We fetch all reviews and find the latest review from each user.
-          # If that latest review is an 'APPROVED' state, we count them as an approver.
           PR_NUMBER=$(jq -r ".pull_request.number" "$GITHUB_EVENT_PATH")
           REVIEWS_URL="https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews"
           echo "Fetching reviews from $REVIEWS_URL"
 
-          APPROVERS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$REVIEWS_URL" | jq -r '
+          REVIEWS_RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$REVIEWS_URL")
+          APPROVERS=$(echo "$REVIEWS_RESPONSE" | jq -r '
             sort_by(.submitted_at) | reverse |
             map(select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")) |
             unique_by(.user.login) |
@@ -140,7 +136,6 @@ jobs:
           echo "Found approvers: $APPROVERS"
 
           # --- 5. Compare Owners and Approvers ---
-          # We check if any of the approvers are in the list of required owners.
           for owner in $FINAL_OWNERS_LIST; do
             for approver in $APPROVERS; do
               if [ "$owner" == "$approver" ]; then
