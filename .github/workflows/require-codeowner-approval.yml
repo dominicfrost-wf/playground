@@ -22,128 +22,112 @@ jobs:
       # including the CODEOWNERS file.
       - name: Checkout repository code
         uses: actions/checkout@v4
-        with:
-          # We need the full history to compare the PR head with its base.
-          fetch-depth: 0
 
       - name: Verify Code Owner Approval
-        env:
-          # The GITHUB_TOKEN is required to make API calls.
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The GITHUB_EVENT_PATH contains the JSON payload of the event that triggered the workflow.
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-        run: |
-          set -e # Exit immediately if a command fails
-          set -x # Print each command before executing it for better debugging
+        uses: actions/github-script@v7
+        with:
+          # The GITHUB_TOKEN is automatically passed to github-script
+          script: |
+            const fs = require('fs');
+            const minimatch = require('minimatch');
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
 
-          # --- 1. Get Changed Files ---
-          TARGET_BRANCH="${{ github.event.pull_request.base.ref }}"
-          echo "Target branch: $TARGET_BRANCH"
-          git fetch origin $TARGET_BRANCH
-          CHANGED_FILES=$(git diff --name-only "origin/$TARGET_BRANCH...${{ github.event.pull_request.head.sha }}")
+            // --- 1. Get Changed Files ---
+            core.info('Fetching changed files...');
+            const { data: changedFiles } = await github.rest.pulls.listFiles({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+            const filepaths = changedFiles.map(f => f.filename);
+            if (filepaths.length === 0) {
+              core.info('No file changes detected. Skipping check.');
+              return;
+            }
+            core.info(`Changed files: ${filepaths.join(', ')}`);
 
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No file changes detected. Skipping check."
-            exit 0
-          fi
-          echo "--- Changed Files ---"
-          echo "$CHANGED_FILES"
-          echo "---------------------"
-
-          # --- 2. Get All Code Owners (Users and Teams) for Changed Files ---
-          CODEOWNERS_FILE=".github/CODEOWNERS"
-          if [ ! -f "$CODEOWNERS_FILE" ]; then
-            echo "No CODEOWNERS file found. Skipping check."
-            exit 0
-          fi
-
-          ALL_OWNERS_RAW=""
-          while IFS= read -r file; do
-            MATCHING_RULE=$(tac "$CODEOWNERS_FILE" | grep -v '^#' | grep -v '^$' | awk -v f="$file" '
-              {
-                pattern = $1
-                gsub(/\./, "\\.", pattern)
-                gsub(/\*/, ".*", pattern)
-                if (f ~ "^" pattern) {
-                  for (i = 2; i <= NF; i++) { print $i }
-                  exit
+            // --- 2. Read and Parse CODEOWNERS file ---
+            const codeownersPath = '.github/CODEOWNERS';
+            if (!fs.existsSync(codeownersPath)) {
+              core.info('No CODEOWNERS file found. Skipping check.');
+              return;
+            }
+            const codeownersContent = fs.readFileSync(codeownersPath, 'utf8');
+            const codeownerLines = codeownersContent.split('\n').filter(line => line && !line.startsWith('#'));
+            
+            const requiredOwners = new Set();
+            for (const path of filepaths) {
+              // Find the last matching rule for the file path
+              let lastMatch = null;
+              for (const line of codeownerLines) {
+                const [pattern] = line.split(/\s+/);
+                if (minimatch(path, pattern)) {
+                  lastMatch = line;
                 }
               }
-            ')
-            if [ -n "$MATCHING_RULE" ]; then
-              ALL_OWNERS_RAW+=$'\n'"$MATCHING_RULE"
-            fi
-          done <<< "$CHANGED_FILES"
 
-          UNIQUE_OWNERS_RAW=$(echo "$ALL_OWNERS_RAW" | sed 's/@//g' | sort -u)
-          if [ -z "$UNIQUE_OWNERS_RAW" ]; then
-              echo "No code owners found for the changed files. Passing."
-              exit 0
-          fi
+              if (lastMatch) {
+                const owners = lastMatch.trim().split(/\s+/).slice(1);
+                owners.forEach(owner => requiredOwners.add(owner.replace('@', '')));
+              }
+            }
 
-          # --- 3. Expand Teams into Individual Members ---
-          USER_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep -v '/' | tr '\n' ' ' || true)
-          TEAM_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep '/' || true)
-          ALL_TEAM_MEMBERS=""
+            if (requiredOwners.size === 0) {
+              core.info('No code owners found for the changed files. Passing.');
+              return;
+            }
 
-          echo "Required user owner(s): @${USER_OWNERS}"
-          echo "Required team owner(s): @${TEAM_OWNERS//$'\n'/ @}"
-          
-          if [ -n "$TEAM_OWNERS" ]; then
-            for team in $TEAM_OWNERS; do
-              ORG=$(echo $team | cut -d'/' -f1)
-              TEAM_SLUG=$(echo $team | cut -d'/' -f2)
-              TEAM_MEMBERS_URL="https://api.github.com/orgs/$ORG/teams/$TEAM_SLUG/members"
-              echo "Fetching members for team @$team from $TEAM_MEMBERS_URL"
-          
-              HTTP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GITHUB_TOKEN" "$TEAM_MEMBERS_URL")
-              if [ "$HTTP_RESPONSE" -ne 200 ]; then
-                echo "ERROR: Failed to fetch team members for @$team. HTTP status: $HTTP_RESPONSE. Check permissions."
-                exit 1
-              fi
-              MEMBERS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$TEAM_MEMBERS_URL" | jq -r '.[].login')
-              ALL_TEAM_MEMBERS+=$'\n'"$MEMBERS"
-            done
-          fi
+            // --- 3. Expand Teams into Individual Members ---
+            const finalOwnerSet = new Set();
+            for (const owner of requiredOwners) {
+              if (owner.includes('/')) {
+                // This is a team
+                const [org, team_slug] = owner.split('/');
+                core.info(`Fetching members for team @${owner}...`);
+                try {
+                  const { data: members } = await github.rest.teams.listMembersInOrg({ org, team_slug });
+                  members.forEach(member => finalOwnerSet.add(member.login));
+                } catch (error) {
+                  core.warning(`Could not fetch members for team @${owner}. Error: ${error.message}`);
+                }
+              } else {
+                // This is an individual user
+                finalOwnerSet.add(owner);
+              }
+            }
 
-          FINAL_OWNERS_LIST=$( (echo "$USER_OWNERS" | tr ' ' '\n'; echo "$ALL_TEAM_MEMBERS") | sort -u | tr '\n' ' ' | sed 's/ $//')
-          
-          if [ -z "$FINAL_OWNERS_LIST" ]; then
-              echo "No code owners could be resolved. Passing."
-              exit 0
-          fi
-          echo "All possible owner(s) for this PR: @${FINAL_OWNERS_LIST// / @}"
+            if (finalOwnerSet.size === 0) {
+              core.info('No code owners could be resolved. Passing.');
+              return;
+            }
+            core.info(`Required approvers for this PR: ${Array.from(finalOwnerSet).map(o => `@${o}`).join(', ')}`);
 
-          # --- 4. Get All Approvers for the PR via GitHub API ---
-          PR_NUMBER=$(jq -r ".pull_request.number" "$GITHUB_EVENT_PATH")
-          REVIEWS_URL="https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews"
-          echo "Fetching reviews from $REVIEWS_URL"
+            // --- 4. Get All Approvers for the PR ---
+            core.info('Fetching reviews for the pull request...');
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
 
-          REVIEWS_RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$REVIEWS_URL")
-          APPROVERS=$(echo "$REVIEWS_RESPONSE" | jq -r '
-            sort_by(.submitted_at) | reverse |
-            map(select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")) |
-            unique_by(.user.login) |
-            map(select(.state == "APPROVED")) |
-            .[] | .user.login
-          ')
+            const latestReviews = {};
+            // Sort reviews to process from oldest to newest
+            reviews.sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at));
+            for (const review of reviews) {
+              if (review.state === 'APPROVED' || review.state === 'CHANGES_REQUESTED') {
+                latestReviews[review.user.login] = review.state;
+              }
+            }
 
-          if [ -z "$APPROVERS" ]; then
-              echo "No valid approvals found on this PR."
-              echo "FAILURE: This PR requires approval from one of the following code owners: @${FINAL_OWNERS_LIST// / @}"
-              exit 1
-          fi
-          echo "Found approvers: $APPROVERS"
+            const approvers = Object.keys(latestReviews).filter(user => latestReviews[user] === 'APPROVED');
+            core.info(`Found approvers: ${approvers.length > 0 ? approvers.map(a => `@${a}`).join(', ') : 'None'}`);
 
-          # --- 5. Compare Owners and Approvers ---
-          for owner in $FINAL_OWNERS_LIST; do
-            for approver in $APPROVERS; do
-              if [ "$owner" == "$approver" ]; then
-                echo "SUCCESS: Found valid approval from code owner @$approver."
-                exit 0
-              fi
-            done
-          done
+            // --- 5. Compare Owners and Approvers ---
+            const hasApproval = approvers.some(approver => finalOwnerSet.has(approver));
 
-          echo "FAILURE: No approval from a required code owner. This PR requires approval from one of: @${FINAL_OWNERS_LIST// / @}"
-          exit 1
+            if (hasApproval) {
+              core.info('SUCCESS: Found valid approval from a code owner.');
+            } else {
+              core.setFailed(`FAILURE: No approval from a required code owner. This PR requires approval from one of: ${Array.from(finalOwnerSet).map(o => `@${o}`).join(', ')}`);
+            }
