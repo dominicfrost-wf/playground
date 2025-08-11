@@ -23,6 +23,10 @@ jobs:
       - name: Checkout repository code
         uses: actions/checkout@v4
 
+      # Install the minimatch dependency needed by the script
+      - name: Install dependencies
+        run: npm install minimatch
+
       - name: Verify Code Owner Approval
         uses: actions/github-script@v7
         with:
