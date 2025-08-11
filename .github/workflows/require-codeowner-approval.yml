@@ -3,10 +3,12 @@
 # Name of the workflow
 name: 'Require Code Owner Approval'
 
-# This workflow runs on every pull request review event
+# This workflow runs when a pull request is opened, updated, or a review is submitted.
 on:
+  pull_request:
+    types: [opened, reopened, synchronize]
   pull_request_review:
-    types: [submitted]
+    types: [submitted, dismissed]
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -14,10 +16,6 @@ jobs:
   check_code_owner_approval:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
-    # We only need to run this check if the review was an approval.
-    # This prevents the workflow from running unnecessarily on comments or requests for changes.
-    if: github.event.review.state == 'approved'
 
     steps:
       # We use the official checkout action to get access to the repository files,
@@ -28,80 +26,129 @@ jobs:
           # We need the full history to compare the PR head with its base.
           fetch-depth: 0
 
-      - name: Verify Approver is a Code Owner
+      - name: Verify Code Owner Approval
+        env:
+          # The GITHUB_TOKEN is required to make API calls.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The GITHUB_EVENT_PATH contains the JSON payload of the event that triggered the workflow.
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: |
           set -e # Exit immediately if a command fails
 
-          # This script performs a basic check to see if the user who approved the PR
-          # is listed as a code owner for at least one of the changed files.
-          #
-          # CAVEATS:
-          # - This script has a simplified parser for the CODEOWNERS file and may not
-          #   handle all complex glob patterns correctly.
-          # - For a more robust, truly dependency-free solution, we recommend using GitHub's
-          #   built-in "Require review from Code Owners" branch protection rule, which
-          #   is the standard and most reliable method.
-
-          APPROVER="@${{ github.event.review.user.login }}"
+          # --- 1. Get Changed Files ---
+          # This determines which files have been modified in the pull request.
           TARGET_BRANCH="${{ github.event.pull_request.base.ref }}"
-
-          echo "Checking approval from user: ${APPROVER}"
-          echo "Pull request is targeting branch: ${TARGET_BRANCH}"
-
-          # Fetch the target branch to ensure we can diff against it
+          echo "Target branch: $TARGET_BRANCH"
           git fetch origin $TARGET_BRANCH
-
-          # Get the list of files changed in this pull request
           CHANGED_FILES=$(git diff --name-only "origin/$TARGET_BRANCH...${{ github.event.pull_request.head.sha }}")
 
           if [ -z "$CHANGED_FILES" ]; then
             echo "No file changes detected. Skipping check."
             exit 0
           fi
-
           echo "--- Changed Files ---"
           echo "$CHANGED_FILES"
           echo "---------------------"
 
+          # --- 2. Get All Code Owners (Users and Teams) for Changed Files ---
+          # This script reads the CODEOWNERS file and collects a unique list of all
+          # owners responsible for the files changed in this PR.
           CODEOWNERS_FILE=".github/CODEOWNERS"
           if [ ! -f "$CODEOWNERS_FILE" ]; then
-            echo "No CODEOWNERS file found at '$CODEOWNERS_FILE'. Skipping check."
+            echo "No CODEOWNERS file found. Skipping check."
             exit 0
           fi
 
-          # We iterate through each changed file and see if the approver owns it.
+          ALL_OWNERS_RAW=""
           while IFS= read -r file; do
-            # Find the last matching rule in CODEOWNERS for the current file.
-            # We use `tac` to read the file backwards, as the last matching pattern takes precedence.
-            # We ignore commented or empty lines.
             MATCHING_RULE=$(tac "$CODEOWNERS_FILE" | grep -v '^#' | grep -v '^$' | awk -v f="$file" '
               {
-                # This is a simple pattern match. It checks if the file path starts
-                # with the pattern specified in the CODEOWNERS file.
                 pattern = $1
-                gsub(/\./, "\\.", pattern) # Escape dots for regex
-                gsub(/\*/, ".*", pattern)   # Replace wildcard * with .*
+                gsub(/\./, "\\.", pattern)
+                gsub(/\*/, ".*", pattern)
                 if (f ~ "^" pattern) {
-                  print $0
+                  # Print all owners from the rule (from column 2 to the end)
+                  for (i = 2; i <= NF; i++) {
+                    print $i
+                  }
                   exit
                 }
               }
             ')
-
-            if [ -z "$MATCHING_RULE" ]; then
-              echo "INFO: No code owner rule found for file: $file"
-              continue # Check the next file
-            fi
-
-            # Check if the approver is listed in the owners for the matched rule.
-            if echo "$MATCHING_RULE" | grep -q -w "$APPROVER"; then
-              echo "SUCCESS: $APPROVER is a valid code owner for the changed file: $file"
-              echo "Rule: $MATCHING_RULE"
-              # Since we found one valid approval, we can exit successfully.
-              exit 0
+            if [ -n "$MATCHING_RULE" ]; then
+              ALL_OWNERS_RAW+=$'\n'"$MATCHING_RULE"
             fi
           done <<< "$CHANGED_FILES"
 
-          # If the script reaches this point, no changed file was owned by the approver.
-          echo "FAILURE: $APPROVER is not listed as a code owner for any of the files in this PR."
+          # Get unique, sorted list of raw owners (@user or @org/team)
+          UNIQUE_OWNERS_RAW=$(echo "$ALL_OWNERS_RAW" | sed 's/@//g' | sort -u)
+          if [ -z "$UNIQUE_OWNERS_RAW" ]; then
+              echo "No code owners found for the changed files. Passing."
+              exit 0
+          fi
+
+          # --- 3. Expand Teams into Individual Members ---
+          # Separate users from teams and expand teams by fetching their members via the API.
+          USER_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep -v '/' | tr '\n' ' ')
+          TEAM_OWNERS=$(echo "$UNIQUE_OWNERS_RAW" | grep '/')
+          ALL_TEAM_MEMBERS=""
+
+          echo "Required user owner(s): @${USER_OWNERS}"
+          echo "Required team owner(s): @${TEAM_OWNERS//$'\n'/ @}"
+          
+          if [ -n "$TEAM_OWNERS" ]; then
+            for team in $TEAM_OWNERS; do
+              ORG=$(echo $team | cut -d'/' -f1)
+              TEAM_SLUG=$(echo $team | cut -d'/' -f2)
+              TEAM_MEMBERS_URL="https://api.github.com/orgs/$ORG/teams/$TEAM_SLUG/members"
+              echo "Fetching members for team @$team from $TEAM_MEMBERS_URL"
+              MEMBERS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$TEAM_MEMBERS_URL" | jq -r '.[].login')
+              ALL_TEAM_MEMBERS+=$'\n'"$MEMBERS"
+            done
+          fi
+
+          # Combine individual user owners and all team members into one final list.
+          FINAL_OWNERS_LIST=$( (echo "$USER_OWNERS" | tr ' ' '\n'; echo "$ALL_TEAM_MEMBERS") | sort -u | tr '\n' ' ' | sed 's/ $//')
+          
+          if [ -z "$FINAL_OWNERS_LIST" ]; then
+              echo "No code owners could be resolved. Passing."
+              exit 0
+          fi
+          echo "All possible owner(s) for this PR: @${FINAL_OWNERS_LIST// / @}"
+
+
+          # --- 4. Get All Approvers for the PR via GitHub API ---
+          # We fetch all reviews and find the latest review from each user.
+          # If that latest review is an 'APPROVED' state, we count them as an approver.
+          PR_NUMBER=$(jq -r ".pull_request.number" "$GITHUB_EVENT_PATH")
+          REVIEWS_URL="https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUMBER}/reviews"
+          echo "Fetching reviews from $REVIEWS_URL"
+
+          APPROVERS=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" "$REVIEWS_URL" | jq -r '
+            sort_by(.submitted_at) | reverse |
+            map(select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")) |
+            unique_by(.user.login) |
+            map(select(.state == "APPROVED")) |
+            .[] | .user.login
+          ')
+
+          if [ -z "$APPROVERS" ]; then
+              echo "No valid approvals found on this PR."
+              echo "FAILURE: This PR requires approval from one of the following code owners: @${FINAL_OWNERS_LIST// / @}"
+              exit 1
+          fi
+          echo "Found approvers: $APPROVERS"
+
+          # --- 5. Compare Owners and Approvers ---
+          # We check if any of the approvers are in the list of required owners.
+          for owner in $FINAL_OWNERS_LIST; do
+            for approver in $APPROVERS; do
+              if [ "$owner" == "$approver" ]; then
+                echo "SUCCESS: Found valid approval from code owner @$approver."
+                exit 0
+              fi
+            done
+          done
+
+          echo "FAILURE: No approval from a required code owner. This PR requires approval from one of: @${FINAL_OWNERS_LIST// / @}"
           exit 1
