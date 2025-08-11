@@ -3,10 +3,10 @@
 # Name of the workflow
 name: 'Require Code Owner Approval'
 
-# This workflow runs on every pull request review event
+# This workflow runs when a pull request is opened, updated, or a review is submitted.
 on:
   pull_request_review:
-    types: [submitted]
+    types: [submitted, dismissed]
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -15,93 +15,121 @@ jobs:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
-    # We only need to run this check if the review was an approval.
-    # This prevents the workflow from running unnecessarily on comments or requests for changes.
-    if: github.event.review.state == 'approved'
-
     steps:
       # We use the official checkout action to get access to the repository files,
       # including the CODEOWNERS file.
       - name: Checkout repository code
         uses: actions/checkout@v4
+
+      # Install the minimatch dependency needed by the script
+      - name: Install dependencies
+        run: npm install minimatch
+
+      - name: Verify Code Owner Approval
+        uses: actions/github-script@v7
         with:
-          # We need the full history to compare the PR head with its base.
-          fetch-depth: 0
+          # The GITHUB_TOKEN is automatically passed to github-script
+          script: |
+            const fs = require('fs');
+            const { minimatch } = require('minimatch');
+            const { owner, repo } = context.repo;
+            const prNumber = context.issue.number;
 
-      - name: Verify Approver is a Code Owner
-        run: |
-          set -e # Exit immediately if a command fails
+            // --- 1. Get Changed Files ---
+            core.info('Fetching changed files...');
+            const { data: changedFiles } = await github.rest.pulls.listFiles({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+            const filepaths = changedFiles.map(f => f.filename);
+            if (filepaths.length === 0) {
+              core.info('No file changes detected. Skipping check.');
+              return;
+            }
+            core.info(`Changed files: ${filepaths.join(', ')}`);
 
-          # This script performs a basic check to see if the user who approved the PR
-          # is listed as a code owner for at least one of the changed files.
-          #
-          # CAVEATS:
-          # - This script has a simplified parser for the CODEOWNERS file and may not
-          #   handle all complex glob patterns correctly.
-          # - For a more robust, truly dependency-free solution, we recommend using GitHub's
-          #   built-in "Require review from Code Owners" branch protection rule, which
-          #   is the standard and most reliable method.
-
-          APPROVER="@${{ github.event.review.user.login }}"
-          TARGET_BRANCH="${{ github.event.pull_request.base.ref }}"
-
-          echo "Checking approval from user: ${APPROVER}"
-          echo "Pull request is targeting branch: ${TARGET_BRANCH}"
-
-          # Fetch the target branch to ensure we can diff against it
-          git fetch origin $TARGET_BRANCH
-
-          # Get the list of files changed in this pull request
-          CHANGED_FILES=$(git diff --name-only "origin/$TARGET_BRANCH...${{ github.event.pull_request.head.sha }}")
-
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "No file changes detected. Skipping check."
-            exit 0
-          fi
-
-          echo "--- Changed Files ---"
-          echo "$CHANGED_FILES"
-          echo "---------------------"
-
-          CODEOWNERS_FILE=".github/CODEOWNERS"
-          if [ ! -f "$CODEOWNERS_FILE" ]; then
-            echo "No CODEOWNERS file found at '$CODEOWNERS_FILE'. Skipping check."
-            exit 0
-          fi
-
-          # We iterate through each changed file and see if the approver owns it.
-          while IFS= read -r file; do
-            # Find the last matching rule in CODEOWNERS for the current file.
-            # We use `tac` to read the file backwards, as the last matching pattern takes precedence.
-            # We ignore commented or empty lines.
-            MATCHING_RULE=$(tac "$CODEOWNERS_FILE" | grep -v '^#' | grep -v '^$' | awk -v f="$file" '
-              {
-                # This is a simple pattern match. It checks if the file path starts
-                # with the pattern specified in the CODEOWNERS file.
-                pattern = $1
-                gsub(/\./, "\\.", pattern) # Escape dots for regex
-                gsub(/\*/, ".*", pattern)   # Replace wildcard * with .*
-                if (f ~ "^" pattern) {
-                  print $0
-                  exit
+            // --- 2. Read and Parse CODEOWNERS file ---
+            const codeownersPath = '.github/CODEOWNERS';
+            if (!fs.existsSync(codeownersPath)) {
+              core.info('No CODEOWNERS file found. Skipping check.');
+              return;
+            }
+            const codeownersContent = fs.readFileSync(codeownersPath, 'utf8');
+            const codeownerLines = codeownersContent.split('\n').filter(line => line && !line.startsWith('#'));
+            
+            const requiredOwners = new Set();
+            for (const path of filepaths) {
+              // Find the last matching rule for the file path
+              let lastMatch = null;
+              for (const line of codeownerLines) {
+                const [pattern] = line.split(/\s+/);
+                if (minimatch(path, pattern)) {
+                  lastMatch = line;
                 }
               }
-            ')
 
-            if [ -z "$MATCHING_RULE" ]; then
-              echo "INFO: No code owner rule found for file: $file"
-              continue # Check the next file
-            fi
+              if (lastMatch) {
+                const owners = lastMatch.trim().split(/\s+/).slice(1);
+                owners.forEach(owner => requiredOwners.add(owner.replace('@', '')));
+              }
+            }
 
-            # Check if the approver is listed in the owners for the matched rule.
-            if echo "$MATCHING_RULE" | grep -q -w "$APPROVER"; then
-              echo "SUCCESS: $APPROVER is a valid code owner for the changed file: $file"
-              echo "Rule: $MATCHING_RULE"
-              # Since we found one valid approval, we can exit successfully.
-              exit 0
-            fi
-          done <<< "$CHANGED_FILES"
+            if (requiredOwners.size === 0) {
+              core.info('No code owners found for the changed files. Passing.');
+              return;
+            }
 
-          # If the script reaches this point, no changed file was owned by the approver.
-          echo "FAILURE: $APPROVER is not listed as a code owner for any of the files in this PR."
-          exit 1
+            // --- 3. Expand Teams into Individual Members ---
+            const finalOwnerSet = new Set();
+            for (const owner of requiredOwners) {
+              if (owner.includes('/')) {
+                // This is a team
+                const [org, team_slug] = owner.split('/');
+                core.info(`Fetching members for team @${owner}...`);
+                try {
+                  const { data: members } = await github.rest.teams.listMembersInOrg({ org, team_slug });
+                  members.forEach(member => finalOwnerSet.add(member.login));
+                } catch (error) {
+                  core.warning(`Could not fetch members for team @${owner}. Error: ${error.message}`);
+                }
+              } else {
+                // This is an individual user
+                finalOwnerSet.add(owner);
+              }
+            }
+
+            if (finalOwnerSet.size === 0) {
+              core.info('No code owners could be resolved. Passing.');
+              return;
+            }
+            core.info(`Required approvers for this PR: ${Array.from(finalOwnerSet).map(o => `@${o}`).join(', ')}`);
+
+            // --- 4. Get All Approvers for the PR ---
+            core.info('Fetching reviews for the pull request...');
+            const { data: reviews } = await github.rest.pulls.listReviews({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+
+            const latestReviews = {};
+            // Sort reviews to process from oldest to newest
+            reviews.sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at));
+            for (const review of reviews) {
+              if (review.state === 'APPROVED' || review.state === 'CHANGES_REQUESTED') {
+                latestReviews[review.user.login] = review.state;
+              }
+            }
+
+            const approvers = Object.keys(latestReviews).filter(user => latestReviews[user] === 'APPROVED');
+            core.info(`Found approvers: ${approvers.length > 0 ? approvers.map(a => `@${a}`).join(', ') : 'None'}`);
+
+            // --- 5. Compare Owners and Approvers ---
+            const hasApproval = approvers.some(approver => finalOwnerSet.has(approver));
+
+            if (hasApproval) {
+              core.info('SUCCESS: Found valid approval from a code owner.');
+            } else {
+              core.setFailed(`FAILURE: No approval from a required code owner. This PR requires approval from one of: ${Array.from(finalOwnerSet).map(o => `@${o}`).join(', ')}`);
+            }
